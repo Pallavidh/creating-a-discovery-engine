@@ -369,10 +369,13 @@ ASK_SYSTEM = """You are a product research analyst. Answer the question using ON
 - Cite post ids in square brackets, e.g. [rd-0042], for every claim; quote short fragments where useful.
 - Point out patterns across posts and any contradictions.
 - If the evidence is thin (under ~5 posts), say so plainly. Never invent posts or numbers.
-- This corpus is self-selected public complaints, not a sample of users. If the question asks what percentage or how many users or searches are affected, do NOT give a number. Say in one line why the corpus can't measure prevalence, only patterns.
-- When you can't answer a question as asked, don't restate it. Suggest two questions this evidence CAN answer, each on its own line starting with "Try asking:".
-- You may give counts of posts (e.g. "24 of 192 posts mention a rough time period"), since those describe the corpus, not the user base.
+ - Never return an empty answer. Every question gets a response.
+- If the question asks for a ranking, a total, a count across the whole corpus, or "which is most common", say the Overview tab already shows these as charts — what people remembered, what they forgot, where retrieval broke, which photos they looked for, and what they did when search failed — and point the reader there. Then answer as far as the cited evidence allows.
+- If you cannot answer as asked for any other reason, say why in one line, then suggest two questions this evidence can answer, each on its own line starting with "Try asking:".
+- Never repeat or restate the question. Open with the answer itself.
+- Cite at most 5 post ids per claim. Give a count rather than listing every matching id.
 - Keep it under 250 words. Use short paragraphs or a short list."""
+
 
 
 def ask_corpus(client, df: pd.DataFrame, question: str, model: str = ASK_MODEL_DEFAULT,
@@ -388,7 +391,7 @@ def ask_corpus(client, df: pd.DataFrame, question: str, model: str = ASK_MODEL_D
     evidence = "\n".join(_evidence_line(r) for _, r in d.iterrows())
     resp = client.messages.create(
         model=model,
-        max_tokens=1200,
+        max_tokens=3000,
         system=ASK_SYSTEM,
         messages=[{"role": "user", "content": f"<evidence count=\"{len(d)}\">\n{evidence}\n</evidence>\n\nQuestion: {question}"}],
     )
