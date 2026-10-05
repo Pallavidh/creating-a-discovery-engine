@@ -1,36 +1,85 @@
-"""Photo Recall Discovery Engine - Streamlit app."""
+"""
+Ask a Question Back — MVP, styled as the Ask Photos screen on an Android phone.
 
+Path A: 20+ photos -> photos plus a narrowing question; answers become filters (max 3).
+Path C: fewer than 20 -> just the photos, then "Did you find it?". "Keep looking" searches more widely.
+Tap a photo to open it; "This is the one" ends the search. The user can end the search at any time.
+"""
+
+import csv
+import glob
 import io
+import json
 import os
+import random
+import time
+import zipfile
+from datetime import datetime
 
-import pandas as pd
-import plotly.express as px
 import streamlit as st
 
-import engine as E
+import mvp_logic as L
+import search as S
 
-st.set_page_config(page_title="Photo Recall Discovery Engine", page_icon="🔎", layout="wide")
+st.set_page_config(page_title="Ask Photos prototype", page_icon="🔍", layout="centered",
+                   initial_sidebar_state="collapsed")
 
-DATA_PATH = "data/tagged.csv"
-BLUE = "#1A5FB4"
-PUBLIC_CALL_LIMIT = 15      # AI calls per visitor session (protects your API budget)
-PUBLIC_ROW_LIMIT = 20       # rows a visitor can run through the pipeline
+LIB_DIR = "library"
+LIB_FILE = os.path.join(LIB_DIR, "library.json")
+PAGE = 21              # photos shown before "+N more" (7 rows of 3)
+MAX_CALLS = 60         # AI calls per visit, protects the API budget
 
-SUGGESTED_QUESTIONS = [
-    "What kinds of old photos do users struggle to retrieve?",
-    "What do people actually remember about a photo they can't find?",
-    "What have they usually forgotten?",
-    "How do users phrase searches when their memory is incomplete?",
-    "What workarounds do people use when search fails?",
-    "How do complaints about Ask Photos differ from complaints about classic search?",
-]
+# ---------------------------------------------------------------- phone styling
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500&display=swap');
+html, body, [class*="st-"], button, input { font-family: 'Roboto', system-ui, sans-serif !important; }
+[data-testid="stAppViewContainer"] { background: #E8EAED; }
+header[data-testid="stHeader"] { background: transparent; }
+.block-container {
+  max-width: 400px !important; background: #FFFFFF; border: 1px solid #DADCE0;
+  border-radius: 32px; padding: 1.2rem 0.8rem 1.6rem !important; margin-top: 1.2rem;
+}
+h1 { font-size: 22px !important; font-weight: 500 !important; padding: 0 0 0.2rem !important; color: #202124; }
+[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: 3px !important; }
+[data-testid="stColumn"], [data-testid="column"] { min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }
+[data-testid="InputInstructions"] { display: none !important; }
+.st-key-grid [data-testid="stVerticalBlock"] { gap: 2px !important; }
+.st-key-grid [data-testid="stHorizontalBlock"] { gap: 2px !important; }
+.st-key-grid [data-testid="stColumn"], .st-key-grid [data-testid="column"] { position: relative; }
+.st-key-grid img { width: 100% !important; aspect-ratio: 1 / 1; object-fit: cover; border-radius: 0; display: block; }
+.st-key-grid [data-testid="stElementContainer"]:has(.stButton) { position: absolute; inset: 0; z-index: 2; margin: 0 !important; }
+.st-key-grid .stButton, .st-key-grid .stButton button { width: 100% !important; height: 100% !important; }
+.st-key-grid .stButton button { opacity: 0; cursor: pointer; }
+.st-key-navbar { border-top: 1px solid #DADCE0; margin-top: 18px; padding-top: 8px; }
+.st-key-navbar p { text-align: center; font-size: 12px; color: #5F6368; margin: 0; line-height: 1.5; }
+.st-key-nav_active p { color: #174EA6; font-weight: 500; }
+.st-key-nav_active { background: #D3E3FD; border-radius: 16px; padding: 2px 0; }
+.st-key-searchbar [data-testid="stTextInput"] input {
+  border-radius: 24px !important; background: #F1F3F4 !important; border: none !important;
+  padding: 10px 16px !important; font-size: 15px !important;
+}
+.st-key-searchbar [data-testid="stTextInput"] > div { border: none !important; background: transparent !important; }
+.st-key-searchbar [data-testid="stFormSubmitButton"] button { border-radius: 20px !important; }
+.st-key-question { background: #E8F0FE; border-radius: 16px; padding: 10px 12px 6px; margin: 4px 0 6px; }
+.st-key-question p { color: #174EA6; }
+.st-key-confirm { background: #F1F3F4; border-radius: 16px; padding: 10px 12px; margin-top: 8px; }
+.st-key-filters button { border-radius: 16px !important; }
+.stButton button, [data-testid="stBaseButton-pills"], [data-testid="stBaseButton-pillsActive"] { border-radius: 18px !important; }
+.small-grey { font-size: 13px; color: #5F6368; margin: 2px 2px 4px; }
+.st-key-challenge { background: #E8F0FE; border-radius: 16px; padding: 12px 12px 4px; margin: 4px 0 8px; }
+.st-key-challengebtn { background: #E8F0FE; border-radius: 16px; padding: 12px 12px 12px; margin-top: 8px; }
+.st-key-tryblock { background: #F0F4F9; border-radius: 16px; padding: 12px 12px 6px; margin-top: 8px; }
+.st-key-tryblock p { margin-bottom: 4px; }
+.meta { font-size: 13px; color: #5F6368; margin: 6px 2px; }
+</style>
+""", unsafe_allow_html=True)
 
 
-# ---------------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------- setup
 
-def secret(name: str, default: str = "") -> str:
+def secret(name, default=""):
     try:
         return st.secrets.get(name, os.getenv(name, default))
     except Exception:
@@ -47,385 +96,405 @@ def get_client():
 
 
 @st.cache_data
-def load_saved(path: str, mtime: float) -> pd.DataFrame:
-    return E.load_tagged(path)
+def load_library(path, mtime):
+    with open(path, encoding="utf-8") as f:
+        photos = json.load(f)
+    return sorted(photos, key=lambda p: p.get("date") or "", reverse=True)
 
 
-TAG_MODEL = secret("TAG_MODEL", E.TAG_MODEL_DEFAULT)
-ASK_MODEL = secret("ASK_MODEL", E.ASK_MODEL_DEFAULT)
+if not os.path.exists(LIB_FILE):
+    for z in sorted(glob.glob("library*.zip")):
+        with zipfile.ZipFile(z) as zf:
+            zf.extractall(".")
+        break
+if not os.path.exists(LIB_FILE):
+    st.error("No photo library found. Add the library folder or library.zip to the repo.")
+    st.stop()
+
 client = get_client()
+LIB = load_library(LIB_FILE, os.path.getmtime(LIB_FILE))
+BY_ID = {p["id"]: p for p in LIB}
 
 ss = st.session_state
+ss.setdefault("attempt", None)
+ss.setdefault("log", [])
 ss.setdefault("calls", 0)
-ss.setdefault("admin", False)
-ss.setdefault("df", None)
-ss.setdefault("answer", None)
+ss.setdefault("target", None)
+ss.setdefault("showing_target", False)
 
 
-def can_call(cost: int = 1) -> bool:
+def budget_ok(cost=1):
     if client is None:
-        st.error("The AI features are off because no API key is set. Add ANTHROPIC_API_KEY to the app secrets.")
+        ss["error"] = "Searching is off because no API key is set."
         return False
-    if ss.admin or ss.calls + cost <= PUBLIC_CALL_LIMIT:
-        return True
-    st.warning(f"This demo allows {PUBLIC_CALL_LIMIT} AI calls per visit. Refresh the page to start a new visit.")
-    return False
+    if ss.calls + cost > MAX_CALLS:
+        ss["error"] = "This prototype allows a limited number of searches per visit. Refresh the page to continue."
+        return False
+    return True
 
 
-def get_data():
-    if ss.df is not None:
-        return ss.df, "Data tagged in this session"
-    if os.path.exists(DATA_PATH):
-        return load_saved(DATA_PATH, os.path.getmtime(DATA_PATH)), "Saved research corpus"
-    return None, None
+def pretty_date(d):
+    try:
+        return datetime.strptime(d, "%Y-%m-%d").strftime("%d %b %Y")
+    except Exception:
+        return d or ""
 
 
-def hbar(series: pd.Series, title: str, total: int | None = None):
-    if series.empty:
-        st.info(f"No data yet for: {title.lower()}")
+def img_path(p):
+    return os.path.join(LIB_DIR, p["file"])
+
+
+# ---------------------------------------------------------------- state changes
+
+def run_search():
+    query = (ss.get("q_input") or "").strip()
+    if not query or not budget_ok():
         return
-    d = series.sort_values().reset_index()
-    d.columns = ["label", "count"]
-    if total:
-        d["text"] = d["count"].astype(str) + "  (" + (d["count"] / total * 100).round().astype(int).astype(str) + "%)"
-    else:
-        d["text"] = d["count"].astype(str)
-    fig = px.bar(d, x="count", y="label", orientation="h", text="text")
-    fig.update_traces(marker_color=BLUE, textposition="outside", cliponaxis=False)
-    fig.update_layout(title=title, height=max(240, 36 * len(d) + 90),
-                      margin=dict(l=10, r=70, t=50, b=10),
-                      xaxis_title=None, yaxis_title=None, font=dict(size=14))
-    st.plotly_chart(fig)
+    try:
+        res = S.search(client, LIB, query)
+    except Exception as e:
+        ss["error"] = f"The search didn't go through ({e}). Try again."
+        return
+    ss.calls += 1
+    filters = L.clue_filters(res["clues"])
+    photos = L.apply_filters([BY_ID[i] for i in res["ids"]], filters)
+    ss.attempt = {
+        "query": query, "ids": res["ids"], "filters": filters,
+        "skip": [f["attr"] for f in filters], "asked": 0, "broad": False, "said_no": False,
+        "answers": [], "started": time.time(), "first_count": len(photos),
+        "path": "A" if L.needs_question(photos, 0) else "C",
+        "shown": PAGE, "q": None, "q_key": None, "viewing": None,
+        "opened": [], "backs": 0, "done": False, "outcome": None, "found_id": None,
+    }
 
 
-def show_tags(r: pd.Series):
-    chips = [
-        f"**Photo:** {E.PHOTO_TYPES.get(r['photo_type'], '')}",
-        f"**Broke at:** {E.FAILURE_STAGES.get(r['failure_stage'], '')}",
-        f"**Outcome:** {E.OUTCOMES.get(r['outcome'], '')}",
-        f"**Stakes:** {E.STAKES.get(r['stakes'], '')}",
-        f"**Search mode:** {E.SEARCH_MODES.get(r.get('search_mode', 'not_stated'), '')}",
-    ]
-    st.markdown("  \n".join(chips))
-    rem = ", ".join(E.REMEMBERED_CUES[c] for c in r["remembered_cues"]) or "Not stated"
-    forg = ", ".join(E.FORGOTTEN_CUES[c] for c in r["forgotten_cues"]) or "Not stated"
-    work = ", ".join(E.WORKAROUNDS[c] for c in r["workarounds"]) or "Not stated"
-    st.markdown(f"**Remembered:** {rem}  \n**Forgot:** {forg}  \n**Workarounds:** {work}")
-    if r.get("query_tried"):
-        st.markdown(f"**Searched for:** `{r['query_tried']}`")
+def photos_now(a):
+    return L.apply_filters([BY_ID[i] for i in a["ids"]], a["filters"])
 
 
-def evidence_card(r: pd.Series):
-    with st.container(border=True):
-        st.markdown(f"> {r['quote'] or r['text'][:200]}")
-        if r.get("insight"):
-            st.markdown(f"**Insight:** {r['insight']}")
-        meta = f"{r['id']} from {r.get('source', '')}"
-        if r.get("url"):
-            meta += f" ([open source]({r['url']}))"
-        st.caption(meta)
-        with st.expander("Tags and full text"):
-            show_tags(r)
-            st.write(r["text"])
+def question_now(a, photos):
+    if not L.needs_question(photos, a["asked"], a["broad"]):
+        return None
+    key = (len(photos), a["asked"], tuple(sorted(a["skip"])))
+    if a["q_key"] == key:
+        return a["q"]
+    q = L.pick_question(photos, set(a["skip"]))
+    if q and client and ss.calls < MAX_CALLS:
+        q["question"] = S.phrase(client, a["query"], q["question"])
+        ss.calls += 1
+    a["q"], a["q_key"] = q, key
+    return q
 
 
-# ---------------------------------------------------------------------------
-# Header and sidebar
-# ---------------------------------------------------------------------------
+def on_answer(widget_key):
+    option = ss.get(widget_key)
+    a = ss.attempt
+    q = a["q"]
+    if not option or not q:
+        return
+    f = L.answer_to_filter(q, option)
+    if f:
+        a["filters"].append(f)
+    a["skip"].append(q["attr"])
+    a["asked"] += 1
+    a["answers"].append(f"{L.LABELS[q['attr']]}: {option}")
+    a["shown"] = PAGE
+    a["q_key"] = None
 
-st.title("Photo Recall Discovery Engine")
-st.write("Why do people fail to find a photo they remember but can't precisely describe? "
-         "This engine reads public user posts about Google Photos, tags each one with what the "
-         "person remembered, what they forgot and where retrieval broke, then compares the problems.")
 
-df_all, data_label = get_data()
+def on_remove_filter(widget_key):
+    label = ss.get(widget_key)
+    a = ss.attempt
+    for i, f in enumerate(a["filters"]):
+        if f"{L.filter_label(f)}  ✕" == label:
+            a["filters"].pop(i)
+            if f["attr"] in a["skip"]:
+                a["skip"].remove(f["attr"])
+            a["answers"].append(f"Removed: {L.filter_label(f)}")
+            break
+    a["shown"] = PAGE
+    a["q_key"] = None
+
+
+def open_photo(pid):
+    a = ss.attempt
+    a["viewing"] = pid
+    a["opened"].append(pid)
+
+
+def back_to_results():
+    a = ss.attempt
+    a["viewing"] = None
+    a["backs"] += 1
+
+
+def more():
+    ss.attempt["shown"] += PAGE
+
+
+def said_no():
+    a = ss.attempt
+    if a["broad"]:
+        finish("Not found")
+        return
+    if not budget_ok():
+        return
+    try:
+        res = S.search(client, LIB, a["query"], broad=True)
+    except Exception as e:
+        ss["error"] = f"The wider search didn't go through ({e}). Try again."
+        return
+    ss.calls += 1
+    a["ids"] = list(dict.fromkeys(a["ids"] + res["ids"]))
+    a["broad"] = True
+    a["said_no"] = True
+    a["answers"].append("Said: keep looking")
+    a["shown"] = PAGE
+    a["q_key"] = None
+
+
+def finish(outcome, pid=None):
+    a = ss.attempt
+    a.update(done=True, outcome=outcome, found_id=pid, viewing=None)
+    ss.log.append({
+        "tester": ss.get("tester", ""),
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "search": a["query"],
+        "first_results": a["first_count"],
+        "path": a["path"],
+        "said_keep_looking": "yes" if a["said_no"] else "no",
+        "questions_answered": a["asked"],
+        "photos_opened": len(a["opened"]),
+        "back_outs": a["backs"],
+        "first_photo_was_kept": ("yes" if pid and a["opened"] and a["opened"][0] == pid else
+                                 "no" if a["opened"] else ""),
+        "steps": " | ".join(a["answers"]),
+        "outcome": outcome,
+        "photo": pid or "",
+        "seconds": round(time.time() - a["started"]),
+        "challenge_photo": ss.target or "",
+        "found_challenge_photo": ("yes" if ss.target and pid == ss.target else
+                                  "no" if ss.target and pid else ""),
+    })
+
+
+def reset():
+    ss.attempt = None
+    ss["q_input"] = ""
+    ss["try_pick"] = None
+    ss.target = None
+
+
+def start_challenge():
+    ss.attempt = None
+    ss["q_input"] = ""
+    ss["try_pick"] = None
+    ss.target = random.choice(LIB)["id"]
+    ss.showing_target = True
+
+
+def library_summary():
+    places = [pl for pl, _ in sorted(
+        ((pl, sum(1 for p in LIB if p.get("place") == pl)) for pl in {p.get("place") for p in LIB if p.get("place")}),
+        key=lambda x: -x[1])]
+    years = sorted({(p.get("date") or "")[:4] for p in LIB if p.get("date")})
+    span = f"{years[0]}–{years[-1]}" if len(years) > 1 else (years[0] if years else "")
+    place_txt = ", ".join(places[:-1]) + (f" and {places[-1]}" if len(places) > 1 else (places[0] if places else ""))
+    return (f"This sample library has {len(LIB)} photos from {span}: trips and days out in {place_txt}, "
+            f"with beaches, mountains, festivals and flowers.")
+
+
+SUGGESTIONS = [
+    "holiday photos",
+    "Ganesh festival",
+    "photos from Berlin",
+    "flowers in the park",
+    "castle in Romania",
+]
+
+
+def try_search():
+    pick = ss.get("try_pick")
+    if not pick:
+        return
+    ss["q_input"] = pick
+    run_search()
+
+
+# ---------------------------------------------------------------- sidebar (outside the phone)
 
 with st.sidebar:
-    st.header("Data")
-    if df_all is None:
-        st.info("No corpus loaded yet. Use the Run the pipeline tab.")
-        sources = []
+    st.header("About this prototype")
+    st.write("Ask Photos with one addition: when a search returns lots of photos, it asks one question at a "
+             "time to narrow them down. Every answer becomes a filter you can remove.")
+    st.text_input("Tester name (for the test log)", key="tester")
+    st.caption(f"Library: {len(LIB)} photos · AI calls this visit: {ss.calls} of {MAX_CALLS}")
+    st.header("Test log")
+    if ss.log:
+        st.dataframe(ss.log, hide_index=True)
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=list(ss.log[0].keys()))
+        w.writeheader()
+        w.writerows(ss.log)
+        st.download_button("Download test log (CSV)", buf.getvalue(), "test_log.csv", "text/csv")
     else:
-        st.write(data_label)
-        sources = sorted(df_all["source"].dropna().unique())
-    chosen_sources = st.multiselect("Sources", sources, default=sources)
+        st.caption("Each finished search is recorded here.")
 
-    st.header("Owner access")
-    if ss.admin:
-        st.success("Unlocked: no call or row limits.")
+
+def bottom_bar():
+    with st.container(key="navbar"):
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(":material/photo_library:  \nPhotos")
+        c2.markdown(":material/collections_bookmark:  \nCollections")
+        with c3:
+            with st.container(key="nav_active"):
+                st.markdown(":material/search:  \nSearch")
+    st.stop()
+
+
+# ---------------------------------------------------------------- the phone screen
+
+a = ss.attempt
+
+# full-screen photo view
+if a and not a["done"] and a["viewing"]:
+    p = BY_ID[a["viewing"]]
+    st.button("← Back to results", type="tertiary", on_click=back_to_results)
+    st.image(img_path(p))
+    st.markdown(f"<p class='meta'>{pretty_date(p.get('date'))} · {p.get('place') or 'Unknown place'}</p>",
+                unsafe_allow_html=True)
+    st.button("This is the one", type="primary", on_click=finish,
+              args=("Found (picked a photo)", p["id"]))
+    st.stop()  # full-screen photo: no bottom bar
+
+# memory challenge: show a photo briefly, then hide it
+if ss.showing_target and ss.target:
+    p = BY_ID[ss.target]
+    st.title("Remember this photo")
+    st.markdown("<p class='small-grey'>Look closely. It disappears in 6 seconds, "
+                "then you'll try to find it.</p>", unsafe_allow_html=True)
+    st.image(img_path(p))
+    time.sleep(6)
+    ss.showing_target = False
+    st.rerun()
+
+st.title("Ask Photos")
+
+with st.form("search", clear_on_submit=False, border=False):
+    with st.container(key="searchbar"):
+        c1, c2 = st.columns([5, 1.4])
+        c1.text_input("Search", key="q_input", label_visibility="collapsed",
+                      placeholder="Search your photos")
+        c2.form_submit_button("Search", type="primary", on_click=run_search)
+
+if ss.get("error"):
+    st.error(ss.pop("error"))
+
+if a is None:
+    if ss.target:
+        with st.container(key="challenge"):
+            st.markdown("**Now find the photo you just saw.**")
+            st.markdown("<p class='small-grey'>Describe it the way you remember it: the place, what was in it, "
+                        "roughly when.</p>", unsafe_allow_html=True)
+        bottom_bar()
+    st.markdown(f"<p class='small-grey'>{library_summary()}</p>", unsafe_allow_html=True)
+    with st.container(key="challengebtn"):
+        st.markdown("**Test it the real way**")
+        st.markdown("<p class='small-grey'>We show you one photo for a few seconds, then hide it. "
+                    "Try to find it again from memory.</p>", unsafe_allow_html=True)
+        st.button("Start the memory challenge", type="primary", on_click=start_challenge)
+    with st.container(key="tryblock"):
+        st.markdown("**Or just try a search:**")
+        st.pills("Try searching", SUGGESTIONS, key="try_pick", label_visibility="collapsed",
+                 on_change=try_search)
+        st.markdown("<p class='small-grey'>Lots of results? It will ask you a question to narrow them down. "
+                    "Only a few? It checks whether you found it.</p>", unsafe_allow_html=True)
+    bottom_bar()
+
+# finished
+if a["done"]:
+    if ss.target and a["found_id"]:
+        if a["found_id"] == ss.target:
+            st.success(f"You found it, in {ss.log[-1]['seconds']} seconds after {a['asked']} "
+                       f"question{'s' if a['asked'] != 1 else ''}.")
+            st.image(img_path(BY_ID[ss.target]))
+        else:
+            st.warning("Close, but not the one. This was the photo:")
+            t = BY_ID[ss.target]
+            st.image(img_path(t))
+            st.markdown(f"<p class='meta'>{pretty_date(t.get('date'))} · {t.get('place') or 'Unknown place'}</p>",
+                        unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        c1.button("Try another", type="primary", on_click=start_challenge)
+        c2.button("Free search", on_click=reset)
+        bottom_bar()
+    if a["found_id"]:
+        p = BY_ID[a["found_id"]]
+        st.success(f"Found in {ss.log[-1]['seconds']} seconds, after {a['asked']} "
+                   f"question{'s' if a['asked'] != 1 else ''}.")
+        st.image(img_path(p))
+    elif a["outcome"].startswith("Found"):
+        st.success("Glad you found it.")
     else:
-        pw = st.text_input("Password", type="password",
-                           help="Lifts the demo limits so the owner can tag the full corpus.")
-        if pw and pw == secret("ADMIN_PASSWORD"):
-            ss.admin = True
-            st.rerun()
-    st.caption(f"AI calls used this visit: {ss.calls}" + ("" if ss.admin else f" of {PUBLIC_CALL_LIMIT}"))
+        st.info("Search ended. Try describing it differently: who was there, the place, or roughly when.")
+    st.button("New search", type="primary", on_click=reset)
+    bottom_bar()
 
-if df_all is not None:
-    df_all = df_all[df_all["source"].isin(chosen_sources)]
-    rel = E.relevant_only(df_all)
-else:
-    rel = pd.DataFrame()
+photos = photos_now(a)
+q = question_now(a, photos)
 
-tabs = st.tabs(["Overview", "Compare problems", "Evidence", "Ask the data",
-                "Run the pipeline", "How it works"])
+# filters (tap to remove)
+if a["filters"]:
+    fkey = f"filters_{len(a['filters'])}_{a['asked']}"
+    with st.container(key="filters"):
+        st.pills("Filters", [f"{L.filter_label(f)}  ✕" for f in a["filters"]], key=fkey,
+                 label_visibility="collapsed", on_change=on_remove_filter, args=(fkey,))
 
+top_l, top_r = st.columns([3, 1])
+top_l.markdown(f"<p class='small-grey'>{len(photos)} photo{'s' if len(photos) != 1 else ''}</p>",
+               unsafe_allow_html=True)
+top_r.button("End search", type="tertiary", on_click=finish, args=("Ended search",))
 
-def need_data() -> bool:
-    if rel.empty:
-        st.info("There is no tagged evidence to show yet. Open Run the pipeline to tag a corpus.")
-        return True
-    return False
+# the question
+if q:
+    qkey = f"q_{a['asked']}_{len(a['filters'])}"
+    with st.container(key="question"):
+        st.markdown(f"**{q['question']}**")
+        opts = q["options"] + ([L.OTHER] if q["has_other"] else []) + [L.NOT_SURE]
+        st.pills("Answer", opts, key=qkey, label_visibility="collapsed",
+                 on_change=on_answer, args=(qkey,))
 
+if not photos:
+    st.markdown("<p class='small-grey'>No photos match. Tap a filter to remove it, or keep looking.</p>",
+                unsafe_allow_html=True)
 
-# ---------------------------------------------------------------------------
-# Overview
-# ---------------------------------------------------------------------------
+# photo grid, 3 across
+shown = photos[: a["shown"]]
+with st.container(key="grid"):
+    for r in range(0, len(shown), 3):
+        cols = st.columns(3)
+        for c, p in zip(cols, shown[r:r + 3]):
+            with c:
+                st.image(img_path(p))
+                st.button("Open", key=f"open_{p['id']}", type="tertiary",
+                          on_click=open_photo, args=(p["id"],))
 
-with tabs[0]:
-    if not need_data():
-        n = len(rel)
-        gave_up = ((rel["outcome"] == "gave_up") | rel["workarounds"].apply(lambda w: "gave_up" in w)).mean()
-        c = st.columns(4)
-        c[0].metric("Posts read", f"{len(df_all):,}")
-        c[1].metric("About finding a photo", f"{n:,}")
-        c[2].metric("Gave up", f"{gave_up:.0%}")
-        c[3].metric("Urgent or practical need", f"{(rel['stakes'] == 'urgent').mean():.0%}")
+if len(photos) > a["shown"]:
+    st.button(f"+{len(photos) - a['shown']} more", type="tertiary", on_click=more)
 
-        hbar(E.count_enum(rel, "failure_stage", E.FAILURE_STAGES),
-             "Where retrieval breaks down", total=n)
-        left, right = st.columns(2)
-        with left:
-            hbar(E.count_list(rel, "remembered_cues", E.REMEMBERED_CUES),
-                 "What people still remember", total=n)
-        with right:
-            hbar(E.count_list(rel, "forgotten_cues", E.FORGOTTEN_CUES),
-                 "What they have forgotten", total=n)
-        left, right = st.columns(2)
-        with left:
-            hbar(E.count_enum(rel, "photo_type", E.PHOTO_TYPES, drop=()),
-                 "Which photos people look for", total=n)
-        with right:
-            hbar(E.count_list(rel, "workarounds", E.WORKAROUNDS),
-                 "What they do when search fails", total=n)
-
-        modes = E.count_enum(rel, "search_mode", E.SEARCH_MODES)
-        if not modes.empty:
-            hbar(modes, "AI search or classic search", total=n)
-            mode_stage = rel[rel["search_mode"].isin(["ask_photos", "classic"])]
-            if not mode_stage.empty:
-                cross = pd.crosstab(mode_stage["failure_stage"], mode_stage["search_mode"])
-                cross = cross.rename(index=E.FAILURE_STAGES, columns=E.SEARCH_MODES)
-                st.caption("Where each search mode breaks down")
-                st.dataframe(cross)
-
-        queries = rel[rel["query_tried"].str.len() > 0]
-        if not queries.empty:
-            st.subheader("Searches people report typing")
-            st.dataframe(queries[["query_tried", "failure_stage", "id"]]
-                         .assign(failure_stage=lambda x: x["failure_stage"].map(E.FAILURE_STAGES))
-                         .rename(columns={"query_tried": "Search", "failure_stage": "Broke at", "id": "Post"}),
-                         hide_index=True)
-
-
-# ---------------------------------------------------------------------------
-# Compare problems
-# ---------------------------------------------------------------------------
-
-with tabs[1]:
-    if not need_data():
-        st.subheader("Which photo types break at which stage")
-        m = E.stage_type_matrix(rel)
-        if m.empty:
-            st.info("Not enough posts with a stated failure stage yet.")
+# few results, or questions used up: a quick check
+if not q:
+    with st.container(key="confirm"):
+        if not photos and not a["broad"]:
+            st.markdown("**Nothing matched closely.**")
+            st.button("Keep looking", type="primary", on_click=said_no)
+        elif not photos:
+            st.markdown("**Nothing close to that in this library.**")
+            st.button("End search", key="end_bottom", on_click=finish, args=("Not found",))
         else:
-            fig = px.imshow(m, text_auto=True, color_continuous_scale="Blues", aspect="auto")
-            fig.update_layout(height=120 + 52 * len(m), xaxis_title=None, yaxis_title=None,
-                              coloraxis_showscale=False, margin=dict(l=10, r=10, t=10, b=10),
-                              font=dict(size=14))
-            fig.update_xaxes(side="top")
-            st.plotly_chart(fig)
+            st.markdown("**Is it here now?**" if a["broad"] else "**Did you find it?**")
+            y, n = st.columns(2)
+            y.button("Yes", type="primary", on_click=finish, args=("Found (said yes)",))
+            n.button("Keep looking", on_click=said_no)
 
-        st.subheader("Problems ranked by opportunity")
-        st.caption("Score = mentions × (1 + share who gave up) × (1 + share with an urgent need). "
-                   "Frequency counts most; problems that end in giving up or block a practical task weigh up to twice as much.")
-        min_n = st.slider("Minimum mentions", 1, 20, 3)
-        opp = E.opportunity_table(rel, min_n=min_n)
-        if opp.empty:
-            st.info("No problem has that many mentions yet. Lower the minimum.")
-        else:
-            st.dataframe(
-                opp[["problem", "mentions", "gave_up_rate", "urgent_rate", "most_remembered", "score"]],
-                hide_index=True,
-                column_config={
-                    "problem": "Problem",
-                    "mentions": "Mentions",
-                    "gave_up_rate": st.column_config.NumberColumn("Gave up", format="%d%%"),
-                    "urgent_rate": st.column_config.NumberColumn("Urgent", format="%d%%"),
-                    "most_remembered": "Most common thing remembered",
-                    "score": st.column_config.ProgressColumn(
-                        "Score", min_value=0, max_value=float(opp["score"].max()), format="%.1f"),
-                },
-            )
-            pick = st.selectbox("See the evidence behind a problem", opp["problem"])
-            row = opp[opp["problem"] == pick].iloc[0]
-            ev = rel[(rel["photo_type"] == row["photo_type"]) & (rel["failure_stage"] == row["failure_stage"])]
-            for _, r in ev.head(8).iterrows():
-                evidence_card(r)
-
-
-# ---------------------------------------------------------------------------
-# Evidence explorer
-# ---------------------------------------------------------------------------
-
-with tabs[2]:
-    if not need_data():
-        c = st.columns(3)
-        f_type = c[0].multiselect("Photo type", list(E.PHOTO_TYPES), format_func=E.PHOTO_TYPES.get)
-        f_stage = c[1].multiselect("Broke at", list(E.FAILURE_STAGES), format_func=E.FAILURE_STAGES.get)
-        f_cue = c[2].multiselect("Remembered", list(E.REMEMBERED_CUES), format_func=E.REMEMBERED_CUES.get)
-        c = st.columns(3)
-        f_out = c[0].multiselect("Outcome", list(E.OUTCOMES), format_func=E.OUTCOMES.get)
-        f_stakes = c[1].multiselect("Stakes", list(E.STAKES), format_func=E.STAKES.get)
-        f_mode = c[2].multiselect("Search mode", list(E.SEARCH_MODES), format_func=E.SEARCH_MODES.get)
-        f_text = st.text_input("Contains words")
-
-        d = rel
-        if f_type:
-            d = d[d["photo_type"].isin(f_type)]
-        if f_stage:
-            d = d[d["failure_stage"].isin(f_stage)]
-        if f_cue:
-            d = d[d["remembered_cues"].apply(lambda cues: any(x in cues for x in f_cue))]
-        if f_out:
-            d = d[d["outcome"].isin(f_out)]
-        if f_stakes:
-            d = d[d["stakes"].isin(f_stakes)]
-        if f_mode:
-            d = d[d["search_mode"].isin(f_mode)]
-        if f_text:
-            d = d[d["text"].str.contains(f_text, case=False, na=False, regex=False)]
-
-        st.write(f"**{len(d)} posts match.** Showing up to 40.")
-        st.download_button("Download these posts (CSV)", E.to_csv_frame(d).to_csv(index=False),
-                           "evidence.csv", "text/csv")
-        for _, r in d.head(40).iterrows():
-            evidence_card(r)
-
-
-# ---------------------------------------------------------------------------
-# Ask the data
-# ---------------------------------------------------------------------------
-
-with tabs[3]:
-    if not need_data():
-        st.write("Ask a research question. Answers use only the tagged posts and cite them by id.")
-        cols = st.columns(len(SUGGESTED_QUESTIONS))
-        for col, q in zip(cols, SUGGESTED_QUESTIONS):
-            if col.button(q, key=f"sq_{q}"):
-                ss.question = q
-        question = st.text_area("Question", key="question", height=80)
-        if st.button("Get answer", type="primary", disabled=not question.strip()) and can_call():
-            with st.spinner("Reading the evidence..."):
-                try:
-                    ss.answer = (question, E.ask_corpus(client, rel, question, model=ASK_MODEL))
-                    ss.calls += 1
-                except Exception as e:
-                    st.error(f"The answer failed: {e}")
-        if ss.answer:
-            st.markdown(f"**{ss.answer[0]}**")
-            st.markdown(ss.answer[1])
-
-
-# ---------------------------------------------------------------------------
-# Run the pipeline
-# ---------------------------------------------------------------------------
-
-with tabs[4]:
-    st.subheader("Tag a single post")
-    st.write("Paste any review or comment to see how the engine reads it.")
-    single = st.text_area("Post text", height=120,
-                          placeholder="e.g. Trying to find a photo of a prescription from last winter. "
-                                      "Searched 'medicine' and 'tablet', got hundreds of pill photos...")
-    if st.button("Tag this post", disabled=not single.strip()) and can_call():
-        with st.spinner("Tagging..."):
-            try:
-                out = E.tag_batch(client, [{"id": "demo", "source": "pasted", "text": single}], model=TAG_MODEL)
-                ss.calls += 1
-                tag = out.get("demo")
-                if not tag:
-                    st.error("The model returned no tags. Try again.")
-                elif not tag["relevant"]:
-                    st.info("Not about finding a specific photo, so the engine filters it out.")
-                else:
-                    st.success(tag["insight"] or "Tagged.")
-                    show_tags(pd.Series(tag))
-            except Exception as e:
-                st.error(f"Tagging failed: {e}")
-
-    st.divider()
-    st.subheader("Run the full pipeline on a CSV")
-    st.write("Upload the corpus from the collection notebook. Required columns: `id`, `text`. "
-             "Optional: `source`, `url`, `date`, `rating`.")
-    if not ss.admin:
-        st.caption(f"Visitors can run the first {PUBLIC_ROW_LIMIT} rows. The owner can run everything.")
-    up = st.file_uploader("Corpus CSV", type="csv")
-    if up is not None:
-        corpus = pd.read_csv(up, dtype={"id": str})
-        missing = {"id", "text"} - set(corpus.columns)
-        if missing:
-            st.error(f"The file is missing these columns: {', '.join(sorted(missing))}")
-        else:
-            if not ss.admin:
-                corpus = corpus.head(PUBLIC_ROW_LIMIT)
-            n_batches = -(-len(corpus) // 10)
-            st.write(f"{len(corpus):,} rows ready, {n_batches} AI calls.")
-            if st.button("Run pipeline", type="primary") and can_call(n_batches):
-                bar = st.progress(0.0, text="Starting...")
-                tagged = E.tag_corpus(
-                    client, corpus, model=TAG_MODEL,
-                    progress_cb=lambda d, t, f: bar.progress(d / t, text=f"Batch {d} of {t}, {f} failed"),
-                )
-                ss.calls += n_batches
-                tagged = E.load_tagged(io.StringIO(E.to_csv_frame(tagged).to_csv(index=False)))
-                ss.df = tagged
-                untagged = int((~tagged["tagged"].astype(str).str.lower().eq("true")).sum())
-                st.success(f"Tagged {len(tagged) - untagged:,} posts. "
-                           f"{int(tagged['relevant'].sum()):,} are about finding a photo. "
-                           "The other tabs now show this data.")
-                if untagged:
-                    st.warning(f"{untagged} posts could not be tagged. Run the file again to retry them.")
-    if ss.df is not None:
-        st.download_button("Download tagged CSV", E.to_csv_frame(ss.df).to_csv(index=False),
-                           "tagged.csv", "text/csv", type="primary")
-        st.caption("To make this the saved corpus for all visitors, commit the file as data/tagged.csv.")
-
-
-# ---------------------------------------------------------------------------
-# How it works
-# ---------------------------------------------------------------------------
-
-with tabs[5]:
-    st.subheader("Pipeline")
-    st.markdown(
-        """
-1. **Collect.** A notebook pulls Play Store and App Store reviews, Reddit posts and comments, and any hand-collected forum or YouTube threads into one CSV. App reviews are pre-filtered for finding-related words.
-2. **Filter.** Claude keeps only posts about trying to find a specific existing photo. Storage, pricing and backup complaints are dropped.
-3. **Extract.** For each kept post, Claude records the photo type, what the person remembered, what they forgot, the search they tried, where retrieval broke, their workaround, the outcome, the stakes, whether they were using AI or classic search, and a verbatim quote.
-4. **Compare.** Posts are aggregated into a photo type × failure stage grid and ranked by an opportunity score.
-5. **Ask.** Research questions are answered from the tagged evidence only, with every claim cited to a post.
-"""
-    )
-    st.subheader("Where retrieval breaks: the five stages")
-    st.markdown(
-        """
-- **Can't turn the memory into a search:** the person remembers something, but not in words search understands.
-- **Search misreads the clues:** they give clues, and results are wrong or empty.
-- **Too many results to judge:** plausible results come back, but they can't tell which is the one.
-- **No way to narrow down after a miss:** a failed search is a dead end, with nothing to build on.
-- **Photo missing from library or index:** it was never backed up, was deleted, or sits in another app.
-"""
-    )
-    st.subheader("Models")
-    st.write(f"Tagging: `{TAG_MODEL}`. Answering questions: `{ASK_MODEL}`.")
-    st.caption("All sources are public posts. The engine stores short quotes and links, not user names.")
+bottom_bar()
